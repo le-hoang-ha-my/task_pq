@@ -197,3 +197,129 @@ class TaskQueue:
         """
         with self._lock:
             return len(self._heap)
+
+
+class Worker:
+    """
+    Worker thread that processes tasks from the queue.
+    """
+    
+    def __init__(
+        self,
+        worker_id: int,
+        queue: TaskQueue,
+        registry: TaskRegistry,
+        metrics: 'Metrics'
+    ):
+        """
+        Initialize worker.
+        
+        Args:
+            worker_id: Unique worker identifier
+            queue: Shared task queue
+            registry: Task function registry
+            metrics: Metrics tracker
+        """
+        self.worker_id = worker_id
+        self.queue = queue
+        self.registry = registry
+        self.metrics = metrics
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self.current_task: Optional[Task] = None
+    
+    def start(self) -> None:
+        """Start the worker thread."""
+        if self._running:
+            logger.warning(f"Worker {self.worker_id} already running")
+            return
+        
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        logger.info(f"Worker {self.worker_id} started")
+    
+    def stop(self) -> None:
+        """Stop the worker thread."""
+        if not self._running:
+            return
+        
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+        logger.info(f"Worker {self.worker_id} stopped")
+    
+    def _run(self) -> None:
+        """Main worker loop."""
+        while self._running:
+            task = self.queue.dequeue(timeout=1.0)
+            if task is None:
+                continue
+            
+            self.current_task = task
+            self._process_task(task)
+            self.current_task = None
+    
+    def _process_task(self, task: Task) -> None:
+        """
+        Execute a single task with retry logic.
+        """
+        func = self.registry.get(task.func_name)
+        if func is None:
+            task.status = TaskStatus.FAILED
+            task.error = f"Function '{task.func_name}' not registered"
+            task.completed_at = datetime.now()
+            logger.error(f"Task {task.id}: {task.error}")
+            self.metrics.record_failure(task)
+            return
+        
+        task.status = TaskStatus.RUNNING
+        task.started_at = datetime.now()
+        logger.info(
+            f"Worker {self.worker_id} processing task {task.id} "
+            f"({task.name}) [attempt {task.retry_count + 1}/{task.max_retries + 1}]"
+        )
+        
+        try:
+            start_time = time.time()
+            result = func(*task.args, **task.kwargs)
+            duration = time.time() - start_time
+            
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = datetime.now()
+            task.result = result
+            
+            self.metrics.record_success(task, duration)
+            logger.info(f"Task {task.id} completed in {duration:.2f}s")
+            
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            task.error = error_msg
+            logger.error(f"Task {task.id} failed: {error_msg}")
+            
+            # Retry logic
+            if task.retry_count < task.max_retries:
+                task.retry_count += 1
+                task.status = TaskStatus.RETRYING
+                
+                # Exponential backoff
+                delay = task.retry_delay * (2 ** (task.retry_count - 1))
+                max_delay = float(os.getenv('QUEUE_MAX_RETRY_DELAY', '60.0'))
+                delay = min(delay, max_delay)
+                
+                logger.info(
+                    f"Retrying task {task.id} in {delay:.1f}s "
+                    f"(attempt {task.retry_count}/{task.max_retries})"
+                )
+                
+                time.sleep(delay)
+                task.status = TaskStatus.PENDING
+                self.queue.enqueue(task)
+            else:
+                task.status = TaskStatus.FAILED
+                task.completed_at = datetime.now()
+                self.metrics.record_failure(task)
+                logger.error(
+                    f"Task {task.id} failed permanently after "
+                    f"{task.retry_count} retries"
+                )
