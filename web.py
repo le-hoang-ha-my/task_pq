@@ -223,7 +223,7 @@ def register_example_tasks(system: TaskQueueSystem) -> None:
 def main():
     # Load configuration from environment
     host = os.getenv('WEB_HOST', '0.0.0.0')
-    port = int(os.getenv('WEB_PORT', '5000'))
+    port = int(os.getenv('WEB_PORT', '8000'))
     debug = os.getenv('WEB_DEBUG', 'false').lower() == 'true'
     
     system = TaskQueueSystem()
