@@ -328,16 +328,12 @@ class Worker:
 class Metrics:
     """
     Thread-safe metrics collection for monitoring queue performance.
-    
     Tracks counts, durations, error types, and provides aggregated statistics.
     """
     
     def __init__(self, retention_size: Optional[int] = None):
         """
         Initialize metrics tracker.
-        
-        Args:
-            retention_size: Number of task durations to keep in memory
         """
         self._lock = threading.Lock()
         self.total_tasks = 0
@@ -378,10 +374,7 @@ class Metrics:
     
     def get_stats(self) -> dict:
         """
-        Get current statistics snapshot.
-        
-        Returns:
-            Dictionary containing all metrics
+        Get current stats.
         """
         with self._lock:
             avg_duration = (
@@ -418,3 +411,208 @@ class Metrics:
             self.tasks_by_priority.clear()
             logger.info("Metrics reset")
 
+
+class TaskQueueSystem:
+    """
+    Main orchestrator.
+    Manages worker pool, task submission, and provides monitoring interface.
+    """
+    
+    def __init__(self, num_workers: Optional[int] = None):
+        """
+        Initialize the task queue system.
+        """
+        self.queue = TaskQueue()
+        self.registry = TaskRegistry()
+        
+        # Load configuration from environment
+        self.num_workers = num_workers or int(os.getenv('QUEUE_NUM_WORKERS', '4'))
+        self.default_max_retries = int(os.getenv('QUEUE_DEFAULT_MAX_RETRIES', '3'))
+        self.default_retry_delay = float(os.getenv('QUEUE_DEFAULT_RETRY_DELAY', '1.0'))
+        
+        self.metrics = Metrics()
+        self.workers: List[Worker] = []
+        self._running = False
+        
+        logger.info(f"TaskQueueSystem initialized with {self.num_workers} workers")
+    
+    def start(self) -> None:
+        """Start all worker threads."""
+        if self._running:
+            logger.warning("System already running")
+            return
+        
+        self._running = True
+        for i in range(self.num_workers):
+            worker = Worker(i, self.queue, self.registry, self.metrics)
+            worker.start()
+            self.workers.append(worker)
+        
+        logger.info(f"Task queue system started with {self.num_workers} workers")
+    
+    def stop(self) -> None:
+        """Stop all worker threads gracefully."""
+        if not self._running:
+            return
+        
+        logger.info("Stopping task queue system...")
+        self._running = False
+        
+        for worker in self.workers:
+            worker.stop()
+        
+        logger.info("Task queue system stopped")
+    
+    def submit_task(
+        self,
+        func_name: str,
+        args: tuple = (),
+        kwargs: Optional[dict] = None,
+        priority: TaskPriority = TaskPriority.MEDIUM,
+        max_retries: Optional[int] = None,
+        retry_delay: Optional[float] = None,
+        task_name: Optional[str] = None
+    ) -> str:
+        """
+        Submit a task to the queue.
+        
+        Args:
+            func_name: Name of the registered function to execute
+            args: Positional arguments for the function
+            kwargs: Keyword arguments for the function
+            priority: Task priority level
+            max_retries: Maximum retry attempts (uses default if None)
+            retry_delay: Initial retry delay (uses default if None)
+            task_name: Human-readable name (uses func_name if None)
+        
+        Returns:
+            Task ID
+        """
+        task_id = str(uuid.uuid4())
+        
+        # Use defaults from environment if not specified
+        if max_retries is None:
+            max_retries = self.default_max_retries
+        if retry_delay is None:
+            retry_delay = self.default_retry_delay
+        
+        task = Task(
+            id=task_id,
+            name=task_name or func_name,
+            func_name=func_name,
+            args=args,
+            kwargs=kwargs or {},
+            priority=priority,
+            max_retries=max_retries,
+            retry_delay=retry_delay
+        )
+        
+        self.queue.enqueue(task)
+        self.metrics.record_enqueue(task)
+        
+        logger.info(
+            f"Task submitted: {task.name} (ID: {task_id[:8]}...) "
+            f"[Priority: {priority.name}]"
+        )
+        
+        return task_id
+    
+    def get_task_status(self, task_id: str) -> Optional[dict]:
+        """
+        Get the status of a task.
+        """
+        task = self.queue.get_task(task_id)
+        return task.to_dict() if task else None
+    
+    def get_dashboard_data(self) -> dict:
+        """
+        Get comprehensive dashboard data.
+        """
+        tasks = self.queue.get_all_tasks()
+        
+        return {
+            'metrics': self.metrics.get_stats(),
+            'queue_size': self.queue.size(),
+            'workers': [
+                {
+                    'id': w.worker_id,
+                    'current_task': w.current_task.to_dict() if w.current_task else None
+                }
+                for w in self.workers
+            ],
+            'recent_tasks': [
+                t.to_dict() for t in sorted(
+                    tasks,
+                    key=lambda x: x.created_at,
+                    reverse=True
+                )[:50]  # Limit to 50 most recent
+            ]
+        }
+
+
+# Example usage
+if __name__ == "__main__":
+    import time
+    
+    # Create system
+    system = TaskQueueSystem(num_workers=3)
+    
+    # Register example tasks
+    @system.registry.register("send_email")
+    def send_email(to: str, subject: str, body: str) -> str:
+        """Simulate sending an email."""
+        time.sleep(0.5)
+        logger.info(f"Email sent to {to}: {subject}")
+        return f"Email sent to {to}"
+    
+    @system.registry.register("process_data")
+    def process_data(data: List[int]) -> int:
+        """Simulate data processing."""
+        time.sleep(1.0)
+        result = sum(data)
+        logger.info(f"Processed {len(data)} items, sum={result}")
+        return result
+    
+    @system.registry.register("flaky_task")
+    def flaky_task(should_fail: bool = False) -> str:
+        """Task that sometimes fails for testing retry logic."""
+        if should_fail:
+            raise ValueError("Simulated failure")
+        return "Success"
+    
+    # Start the system
+    system.start()
+    
+    try:
+        # Submit various tasks
+        system.submit_task(
+            "send_email",
+            args=("user@example.com", "Hello", "Test message"),
+            priority=TaskPriority.HIGH
+        )
+        system.submit_task(
+            "process_data",
+            args=([1, 2, 3, 4, 5],),
+            priority=TaskPriority.MEDIUM
+        )
+        system.submit_task(
+            "flaky_task",
+            kwargs={"should_fail": True},
+            priority=TaskPriority.LOW,
+            max_retries=2
+        )
+        
+        # Let tasks process
+        time.sleep(5)
+        
+        # Print metrics
+        stats = system.metrics.get_stats()
+        print("\n=== System Metrics ===")
+        print(f"Total tasks: {stats['total_tasks']}")
+        print(f"Completed: {stats['completed_tasks']}")
+        print(f"Failed: {stats['failed_tasks']}")
+        print(f"Success rate: {stats['success_rate']}%")
+        print(f"Avg duration: {stats['avg_duration']}s")
+        
+    finally:
+        system.stop()
