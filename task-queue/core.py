@@ -323,3 +323,98 @@ class Worker:
                     f"Task {task.id} failed permanently after "
                     f"{task.retry_count} retries"
                 )
+
+
+class Metrics:
+    """
+    Thread-safe metrics collection for monitoring queue performance.
+    
+    Tracks counts, durations, error types, and provides aggregated statistics.
+    """
+    
+    def __init__(self, retention_size: Optional[int] = None):
+        """
+        Initialize metrics tracker.
+        
+        Args:
+            retention_size: Number of task durations to keep in memory
+        """
+        self._lock = threading.Lock()
+        self.total_tasks = 0
+        self.completed_tasks = 0
+        self.failed_tasks = 0
+        self.total_duration = 0.0
+        self.task_durations: List[float] = []
+        self.errors_by_type: Dict[str, int] = defaultdict(int)
+        self.tasks_by_priority: Dict[str, int] = defaultdict(int)
+        self.retention_size = retention_size or int(
+            os.getenv('QUEUE_METRICS_RETENTION', '1000')
+        )
+    
+    def record_enqueue(self, task: Task) -> None:
+        """Record a task being added to the queue."""
+        with self._lock:
+            self.total_tasks += 1
+            self.tasks_by_priority[task.priority.name] += 1
+    
+    def record_success(self, task: Task, duration: float) -> None:
+        """Record a successful task completion."""
+        with self._lock:
+            self.completed_tasks += 1
+            self.total_duration += duration
+            self.task_durations.append(duration)
+            
+            # Keep only recent durations for memory efficiency
+            if len(self.task_durations) > self.retention_size:
+                self.task_durations.pop(0)
+    
+    def record_failure(self, task: Task) -> None:
+        """Record a task failure."""
+        with self._lock:
+            self.failed_tasks += 1
+            if task.error:
+                error_type = task.error.split(':')[0].strip()
+                self.errors_by_type[error_type] += 1
+    
+    def get_stats(self) -> dict:
+        """
+        Get current statistics snapshot.
+        
+        Returns:
+            Dictionary containing all metrics
+        """
+        with self._lock:
+            avg_duration = (
+                self.total_duration / self.completed_tasks
+                if self.completed_tasks > 0
+                else 0
+            )
+            success_rate = (
+                (self.completed_tasks / self.total_tasks * 100)
+                if self.total_tasks > 0
+                else 0
+            )
+            
+            return {
+                'total_tasks': self.total_tasks,
+                'completed_tasks': self.completed_tasks,
+                'failed_tasks': self.failed_tasks,
+                'pending_tasks': self.total_tasks - self.completed_tasks - self.failed_tasks,
+                'success_rate': round(success_rate, 2),
+                'avg_duration': round(avg_duration, 3),
+                'errors_by_type': dict(self.errors_by_type),
+                'tasks_by_priority': dict(self.tasks_by_priority)
+            }
+    
+    def reset(self) -> None:
+        """Reset all metrics to zero."""
+        with self._lock:
+            self.total_tasks = 0
+            self.completed_tasks = 0
+            self.failed_tasks = 0
+            self.total_duration = 0.0
+            self.task_durations.clear()
+            self.errors_by_type.clear()
+            self.tasks_by_priority.clear()
+            logger.info("Metrics reset")
+
