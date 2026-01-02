@@ -129,7 +129,7 @@ Edit `web.py` and add functions to the `register_example_tasks()` function:
 def register_example_tasks(system: TaskQueueSystem) -> None:
     # ...existing tasks...
     
-    # Add you custom task
+    # Add your custom task
     @system.registry.register("fetch_user_data")
     def fetch_user_data(user_id: int):
         """Fetch data for a user from API."""
